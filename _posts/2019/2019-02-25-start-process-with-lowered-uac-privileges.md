@@ -1,7 +1,7 @@
 ---
 title: "在 Windows 系统上降低 UAC 权限运行程序（从管理员权限降权到普通用户权限）"
 publishDate: 2019-02-25 07:28:19 +0800
-date: 2022-01-27 12:50:19 +0800
+date: 2026-01-05 12:50:19 +0800
 tags: windows dotnet csharp
 position: problem
 permalink: /post/start-process-with-lowered-uac-privileges.html
@@ -113,18 +113,164 @@ Process.Start(processInfo);
 
 ## 方法四：使用 Shell 进程的 Access Token 来启动进程
 
-此方法需要较多的 Windows API 调用，我没有尝试过这种方法，但是你可以自行尝试下面的链接：
+此方法需要较多的 Windows API 调用，步骤如下：
 
-- [c# - How do you de-elevate privileges for a child process - Stack Overflow](https://stackoverflow.com/a/49997055/6233938)
+1. 通过 GetShellWindow 方法获取 Shell 窗口的窗口句柄，然后通过 GetWindowThreadProcessId 从 Shell 窗口的窗口句柄获取 Shell 进程。一般而言，这里的 Shell 进程就是 explorer.exe 进程
+2. 通过 OpenProcess_SafeHandle 和 OpenProcessToken 方法获取到 Shell 进程的 Access Token 用于后续启动进程。将拿到的 Access Token 传入 DuplicateTokenEx 方法进行复制，用于创建进程时传入
+3. 将 DuplicateTokenEx 方法获取的 Access Token 传入到 CreateProcessWithToken 方法创建进程
+
+核心的代码如下：
+
+```csharp
+public static class ProcessRunner
+{
+    /// <summary>
+    /// 降权启动
+    /// </summary>
+    /// <param name="fileName"></param>
+    /// <param name="arguments"></param>
+    /// <param name="logger"></param>
+    /// <returns></returns>
+    [SupportedOSPlatform("windows6.0.6000")] // 绝大部分方法都是 5.x 就可以用的，只有 CreateProcessWithToken 是 6.0.6000 才有的。好在 Windows Vista 就是 6.0 了。而 Win7 都到 6.1 了
+    public static unsafe StartProcessWithShellProcessTokenResult StartProcessWithShellProcessToken(string fileName, string? arguments)
+    {
+        if (!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))
+        {
+            var process = Process.Start(new ProcessStartInfo(fileName, arguments ?? string.Empty)
+            {
+                WorkingDirectory = Path.GetDirectoryName(fileName)
+            });
+
+            if (process != null)
+            {
+                return new StartProcessWithShellProcessTokenResult(true, process.Id, "OK");
+            }
+            else
+            {
+                return new(false, -1, "Process.Start return null");
+            }
+        }
+
+        var shellWindow = GetShellWindow();
+        if (shellWindow == IntPtr.Zero)
+        {
+            return new(false, -1, "GetShellWindow Failed");
+        }
+
+        GetWindowThreadProcessId(shellWindow, out var processId);
+
+        if (processId == 0)
+        {
+            return new(false, -1, "GetWindowThreadProcessId Failed");
+        }
+
+        SafeHandle? processHandle = null;
+        SafeFileHandle? shellToken = null;
+        SafeFileHandle? duplicateToken = null;
+        try
+        {
+            processHandle = OpenProcess_SafeHandle(PROCESS_ACCESS_RIGHTS.PROCESS_QUERY_INFORMATION, false, processId);
+            if (processHandle.IsInvalid)
+            {
+                var errorCode = Marshal.GetLastPInvokeError();
+
+                return new(false, -1, $"OpenProcess Failed {errorCode}: {Marshal.GetPInvokeErrorMessage(errorCode)}");
+            }
+
+            if (!OpenProcessToken(processHandle, (TOKEN_ACCESS_MASK) 0x02000000, out shellToken))
+            {
+                var errorCode = Marshal.GetLastPInvokeError();
+
+                return new(false, -1, $"OpenProcessToken Failed {errorCode}: {Marshal.GetPInvokeErrorMessage(errorCode)}");
+            }
+
+            if (!DuplicateTokenEx(shellToken, (TOKEN_ACCESS_MASK) 0x02000000, null,
+                    SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation, TOKEN_TYPE.TokenPrimary, out duplicateToken))
+            {
+                var errorCode = Marshal.GetLastPInvokeError();
+
+                return new(false, -1, $"DuplicateTokenEx Failed {errorCode}: {Marshal.GetPInvokeErrorMessage(errorCode)}");
+
+            }
+
+            var startupInfo = new STARTUPINFOW
+            {
+                cb = (uint) Unsafe.SizeOf<STARTUPINFOW>(),
+            };
+            var commandLine = $@"""{fileName}"" {arguments}";
+            Span<char> lpCommandLine = stackalloc char[commandLine.Length + 1];
+            commandLine.AsSpan().CopyTo(lpCommandLine);
+
+            var result = CreateProcessWithToken(duplicateToken, 0, null, ref lpCommandLine,
+                0, null, Path.GetDirectoryName(fileName)!, in startupInfo, out var information);
+            if (!result)
+            {
+                var errorCode = Marshal.GetLastPInvokeError();
+
+                return new(false, -1, $"CreateProcessWithTokenW Failed {errorCode}: {Marshal.GetPInvokeErrorMessage(errorCode)}");
+            }
+            else
+            {
+                CloseHandle(information.hProcess);
+                CloseHandle(information.hThread);
+            }
+
+            return new(true, (int) information.dwProcessId, "OK");
+        }
+        finally
+        {
+            if (processHandle?.IsInvalid is false)
+            {
+                CloseHandle((HANDLE) processHandle.DangerousGetHandle());
+            }
+
+            if (shellToken?.IsInvalid is false)
+            {
+                CloseHandle((HANDLE) shellToken.DangerousGetHandle());
+            }
+
+            if (duplicateToken?.IsInvalid is false)
+            {
+                CloseHandle((HANDLE) duplicateToken.DangerousGetHandle());
+            }
+        }
+    }
+}
+
+public readonly record struct StartProcessWithShellProcessTokenResult(bool Success, int ProcessId, string? ErrorMessage);
+```
+
+所需的 Win32 API 均通过 [CsWin32](https://www.nuget.org/packages/Microsoft.Windows.CsWin32) 库实现，其 NativeMethods.txt 内容如下：
+
+```
+CoCreateInstance
+OpenProcess
+OpenProcessToken
+GetExitCodeProcess
+CloseHandle
+DuplicateTokenEx
+CreateProcessWithToken
+GetShellWindow
+GetWindowThreadProcessId
+```
+
+完全的项目代码 [github](https://github.com/lindexi/lindexi_gd/tree/37b1367680592d8f80c0a950d96474ac1ec2a806/Workbench/FefaleregairHelhigacemwai) 上，可使用如下命令拉取
+
+```
+# 新建一个文件夹，随后使用 cd 命令进入此文件夹，或直接在此文件夹内输入以下命令
+git init
+git remote add origin https://github.com/lindexi/lindexi_gd.git
+git pull origin 37b1367680592d8f80c0a950d96474ac1ec2a806
+```
+
+获取代码之后，进入 Workbench/FefaleregairHelhigacemwai 文件夹，即可获取到源代码
 
 ---
 
 **参考资料**
 
 - [c# starting process with lowered privileges from UAC admin level process - Stack Overflow](https://stackoverflow.com/q/7870319/6233938)
-- [c# - How do you de-elevate privileges for a child process - Stack Overflow](https://stackoverflow.com/q/1173630/6233938)
-- [c# - How do you de-elevate privileges for a child process - Stack Overflow](https://stackoverflow.com/a/49997055/6233938)
+- [c# - How do you de-elevate privileges for a child process - Stack Overflow](https://stackoverflow.com/questions/1173630/how-do-you-de-elevate-privileges-for-a-child-process)
 - [windows - Force a program to run *without* administrator privileges or UAC? - Super User](https://superuser.com/q/171917/940098)
 - [High elevation can be bad for your application: How to start a non-elevated process at the end of the installation - CodeProject](https://www.codeproject.com/Articles/18946/High-elevation-can-be-bad-for-your-application-How)
 - [How to Enable Drag and Drop for an Elevated MFC Application on Vista/Windows 7 • Helge Klein](https://helgeklein.com/blog/2010/03/how-to-enable-drag-and-drop-for-an-elevated-mfc-application-on-vistawindows-7/)
-
